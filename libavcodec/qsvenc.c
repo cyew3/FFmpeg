@@ -1319,6 +1319,13 @@ static void clear_unused_frames(QSVEncContext *q)
     QSVFrame *cur = q->work_frames;
     while (cur) {
         if (cur->used && !cur->surface.Data.Locked) {
+
+            for (int i = 0; i < cur->enc_ctrl.NumExtParam; i++) {
+                if (cur->enc_ctrl.ExtParam[i])
+                    av_freep(&(cur->enc_ctrl.ExtParam[i]));
+            }
+            cur->enc_ctrl.NumExtParam = 0;
+
             free_encoder_ctrl_payloads(&cur->enc_ctrl);
             //do not reuse enc_ctrl from previous frame
             memset(&cur->enc_ctrl, 0, sizeof(cur->enc_ctrl));
@@ -1360,6 +1367,12 @@ static int get_free_frame(QSVEncContext *q, QSVFrame **f)
     }
     frame->enc_ctrl.Payload = av_mallocz(sizeof(mfxPayload*) * QSV_MAX_ENC_PAYLOAD);
     if (!frame->enc_ctrl.Payload) {
+        av_freep(&frame);
+        return AVERROR(ENOMEM);
+    }
+    frame->enc_ctrl.ExtParam = av_mallocz(sizeof(mfxExtBuffer*) * QSV_MAX_ENC_EXTPARAM);
+    if (!frame->enc_ctrl.ExtParam) {
+        av_free(frame->enc_ctrl.Payload);
         av_freep(&frame);
         return AVERROR(ENOMEM);
     }
@@ -1466,6 +1479,7 @@ static int encode_frame(AVCodecContext *avctx, QSVEncContext *q,
                         const AVFrame *frame)
 {
     AVPacket new_pkt = { 0 };
+    AVFrameSideData *sd;
     mfxBitstream *bs = NULL;
 #if QSV_VERSION_ATLEAST(1, 26)
     mfxExtAVCEncodedFrameInfo *enc_info = NULL;
@@ -1476,6 +1490,7 @@ static int encode_frame(AVCodecContext *avctx, QSVEncContext *q,
     mfxSyncPoint *sync     = NULL;
     QSVFrame *qsv_frame = NULL;
     mfxEncodeCtrl* enc_ctrl = NULL;
+    mfxExtEncoderROI *enc_roi = NULL;
     int ret;
 
     if (frame) {
@@ -1508,6 +1523,8 @@ static int encode_frame(AVCodecContext *avctx, QSVEncContext *q,
     bs->Data      = new_pkt.data;
     bs->MaxLength = new_pkt.size;
 
+    enc_info = NULL;
+    enc_buf = NULL;
 #if QSV_VERSION_ATLEAST(1, 26)
     if (avctx->codec_id == AV_CODEC_ID_H264) {
         enc_info = av_mallocz(sizeof(*enc_info));
@@ -1529,6 +1546,62 @@ static int encode_frame(AVCodecContext *avctx, QSVEncContext *q,
     if (q->set_encode_ctrl_cb) {
         q->set_encode_ctrl_cb(avctx, frame, &qsv_frame->enc_ctrl);
     }
+
+#if QSV_VERSION_ATLEAST(1, 22)
+    sd = NULL;
+    if (frame) {
+        sd = av_frame_get_side_data(frame,
+                                    AV_FRAME_DATA_REGIONS_OF_INTEREST);
+    }
+    if (sd) {
+        AVRegionOfInterest *roi;
+        uint32_t roi_size;
+        int nb_roi, i;
+
+        enc_roi = (mfxExtEncoderROI *)av_mallocz(sizeof(*enc_roi));
+        if (!enc_roi) {
+            av_packet_unref(&new_pkt);
+            if (bs)
+                av_freep(bs);
+            if (enc_info)
+                av_freep(&enc_info);
+            if (enc_buf)
+                av_freep(&enc_buf);
+            return AVERROR(ENOMEM);
+        }
+        roi = (AVRegionOfInterest *)sd->data;
+        roi_size = roi->self_size;
+        av_assert0(roi_size && sd->size % roi_size == 0);
+        nb_roi = sd->size / roi_size;
+        if (nb_roi > QSV_MAX_ROI_NUM) {
+            av_log(avctx, AV_LOG_WARNING, "More ROIs set than "
+                    "supported by driver (%d > %d).\n",
+                    nb_roi, QSV_MAX_ROI_NUM);
+            nb_roi = QSV_MAX_ROI_NUM;
+        }
+        enc_roi->Header.BufferId = MFX_EXTBUFF_ENCODER_ROI;
+        enc_roi->Header.BufferSz = sizeof(*enc_roi);
+        enc_roi->NumROI  = nb_roi;
+        enc_roi->ROIMode = MFX_ROI_MODE_QP_DELTA;
+        // For overlapping regions, the first in the array takes priority.
+        for (i = 0; i < nb_roi; i++) {
+            roi = (AVRegionOfInterest*)(sd->data + roi_size * i);
+            av_assert0(roi->qoffset.den != 0);
+
+            enc_roi->ROI[i].Top = roi->top & 0xfffffff0;
+            enc_roi->ROI[i].Bottom = roi->bottom & 0xfffffff0;
+            enc_roi->ROI[i].Left = (roi->left & 0xfffffff0) + 0x10;
+            enc_roi->ROI[i].Right = (roi->right & 0xfffffff0) + 0x10;
+            enc_roi->ROI[i].DeltaQP =
+                        roi->qoffset.num * 51 / roi->qoffset.den;
+            av_log(avctx, AV_LOG_DEBUG, "ROI: (%d,%d)-(%d,%d) -> %+d.\n",
+                   roi->top, roi->left, roi->bottom, roi->right,
+                   enc_roi->ROI[i].DeltaQP);
+        }
+        enc_ctrl->ExtParam[enc_ctrl->NumExtParam] = (mfxExtBuffer *)enc_roi;
+        enc_ctrl->NumExtParam += 1;
+    }
+#endif
 
     sync = av_mallocz(sizeof(*sync));
     if (!sync)
@@ -1665,6 +1738,7 @@ int ff_qsv_enc_close(AVCodecContext *avctx, QSVEncContext *q)
         q->work_frames = cur->next;
         av_frame_free(&cur->frame);
         av_free(cur->enc_ctrl.Payload);
+        av_free(cur->enc_ctrl.ExtParam);
         av_freep(&cur);
         cur = q->work_frames;
     }
