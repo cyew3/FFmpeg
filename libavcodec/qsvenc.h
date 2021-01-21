@@ -199,6 +199,7 @@ typedef struct QSVEncContext {
     int repeat_pps;
     int low_power;
     int gpb;
+    int transform_skip;
 
     int a53_cc;
 
