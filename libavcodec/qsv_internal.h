@@ -86,6 +86,7 @@ typedef struct QSVFrame {
 
     int queued;
     int used;
+    int external_frame;
 
     struct QSVFrame *next;
 } QSVFrame;
