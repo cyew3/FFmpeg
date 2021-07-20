@@ -610,7 +610,18 @@ static int qsv_create_mfx_session(void *ctx,
         goto fail;
     }
 
-    if (MFX_IMPL_VIA_D3D9 == MFX_IMPL_VIA_MASK(implementation)) {
+    if (MFX_IMPL_VIA_D3D11 == MFX_IMPL_VIA_MASK(implementation)) {
+        impl_value.Type = MFX_VARIANT_TYPE_U32;
+        impl_value.Data.U32 = MFX_ACCEL_MODE_VIA_D3D11;
+        sts = MFXSetConfigFilterProperty(cfg,
+                                         (const mfxU8 *)"mfxImplDescription.AccelerationMode", impl_value);
+
+        if (sts != MFX_ERR_NONE) {
+             av_log(ctx, AV_LOG_ERROR, "Error adding a MFX configuration"
+                     "MFX_ACCEL_MODE_VIA_D3D11 property: %d.\n", sts);
+              goto fail;
+        }
+    } else if (MFX_IMPL_VIA_D3D9 == MFX_IMPL_VIA_MASK(implementation)) {
         impl_value.Type = MFX_VARIANT_TYPE_U32;
         impl_value.Data.U32 = MFX_ACCEL_MODE_VIA_D3D9;
         sts = MFXSetConfigFilterProperty(cfg,
