@@ -110,7 +110,6 @@ typedef struct VulkanPipeline {
     VkDescriptorSet            *desc_set;
     VkDescriptorUpdateTemplate *desc_template;
     int                         desc_layout_num;
-    int                         descriptor_sets_num;
     int                         pool_size_desc_num;
 
     /* Temporary, used to store data in between initialization stages */

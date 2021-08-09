@@ -1151,7 +1151,7 @@ void ff_vk_update_descriptor_set(AVFilterContext *avctx, VulkanPipeline *pl,
     VulkanFilterContext *s = avctx->priv;
 
     vkUpdateDescriptorSetWithTemplate(s->hwctx->act_dev,
-                                      pl->desc_set[s->cur_queue_idx * pl->desc_layout_num + set_id],
+                                      pl->desc_set[set_id],
                                       pl->desc_template[set_id],
                                       s);
 }
@@ -1170,14 +1170,12 @@ int ff_vk_init_pipeline_layout(AVFilterContext *avctx, VulkanPipeline *pl)
     VkResult ret;
     VulkanFilterContext *s = avctx->priv;
 
-    pl->descriptor_sets_num = pl->desc_layout_num * s->queue_count;
-
     { /* Init descriptor set pool */
         VkDescriptorPoolCreateInfo pool_create_info = {
             .sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
             .poolSizeCount = pl->pool_size_desc_num,
             .pPoolSizes    = pl->pool_size_desc,
-            .maxSets       = pl->descriptor_sets_num,
+            .maxSets       = pl->desc_layout_num,
         };
 
         ret = vkCreateDescriptorPool(s->hwctx->act_dev, &pool_create_info,
@@ -1194,11 +1192,11 @@ int ff_vk_init_pipeline_layout(AVFilterContext *avctx, VulkanPipeline *pl)
         VkDescriptorSetAllocateInfo alloc_info = {
             .sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
             .descriptorPool     = pl->desc_pool,
-            .descriptorSetCount = pl->descriptor_sets_num,
+            .descriptorSetCount = pl->desc_layout_num,
             .pSetLayouts        = pl->desc_layout,
         };
 
-        pl->desc_set = av_malloc(pl->descriptor_sets_num*sizeof(*pl->desc_set));
+        pl->desc_set = av_malloc(pl->desc_layout_num*sizeof(*pl->desc_set));
         if (!pl->desc_set)
             return AVERROR(ENOMEM);
 
@@ -1234,12 +1232,12 @@ int ff_vk_init_pipeline_layout(AVFilterContext *avctx, VulkanPipeline *pl)
     { /* Descriptor template (for tightly packed descriptors) */
         VkDescriptorUpdateTemplateCreateInfo *desc_template_info;
 
-        pl->desc_template = av_malloc(pl->descriptor_sets_num*sizeof(*pl->desc_template));
+        pl->desc_template = av_malloc(pl->desc_layout_num*sizeof(*pl->desc_template));
         if (!pl->desc_template)
             return AVERROR(ENOMEM);
 
         /* Create update templates for the descriptor sets */
-        for (int i = 0; i < pl->descriptor_sets_num; i++) {
+        for (int i = 0; i < pl->desc_layout_num; i++) {
             desc_template_info = &pl->desc_template_info[i % pl->desc_layout_num];
             desc_template_info->pipelineLayout = pl->pipeline_layout;
             ret = vkCreateDescriptorUpdateTemplate(s->hwctx->act_dev,
@@ -1309,7 +1307,7 @@ void ff_vk_bind_pipeline_exec(AVFilterContext *avctx, FFVkExecContext *e,
     vkCmdBindPipeline(e->bufs[s->cur_queue_idx], pl->bind_point, pl->pipeline);
 
     vkCmdBindDescriptorSets(e->bufs[s->cur_queue_idx], pl->bind_point,
-                            pl->pipeline_layout, 0, pl->descriptor_sets_num,
+                            pl->pipeline_layout, 0, pl->desc_layout_num,
                             pl->desc_set, 0, 0);
 
     e->bound_pl = pl;
@@ -1392,7 +1390,7 @@ static void free_pipeline(VulkanFilterContext *s, VulkanPipeline *pl)
     /* Only freed in case of failure */
     av_freep(&pl->pool_size_desc);
     if (pl->desc_template_info) {
-        for (int i = 0; i < pl->descriptor_sets_num; i++)
+        for (int i = 0; i < pl->desc_layout_num; i++)
             av_free((void *)pl->desc_template_info[i].pDescriptorUpdateEntries);
         av_freep(&pl->desc_template_info);
     }
