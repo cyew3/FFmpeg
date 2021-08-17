@@ -94,6 +94,10 @@ typedef struct QSVContext {
 
     mfxPayload payload;
 
+#if 1 // extdecvideoprocessing
+    mfxExtDecVideoProcessing *extdecvideoprocessing;
+#endif
+
     mfxExtBuffer **ext_buffers;
     int         nb_ext_buffers;
 
@@ -314,6 +318,36 @@ static int qsv_decode_init_context(AVCodecContext *avctx, QSVContext *q, mfxVide
     avctx->profile      = param->mfx.CodecProfile;
     avctx->field_order  = ff_qsv_map_picstruct(param->mfx.FrameInfo.PicStruct);
     avctx->pix_fmt      = ff_qsv_map_fourcc(param->mfx.FrameInfo.FourCC);
+
+#if 1 // extdecvideoprocessing
+    mfxExtDecVideoProcessing *extdecvideoprocessing = av_mallocz(sizeof(mfxExtDecVideoProcessing));
+    extdecvideoprocessing->In.CropX = 0;
+    extdecvideoprocessing->In.CropY = 0;
+    extdecvideoprocessing->In.CropW = param->mfx.FrameInfo.CropW;
+    extdecvideoprocessing->In.CropH = param->mfx.FrameInfo.CropH;
+
+    // FIXME - hardcode for now
+    extdecvideoprocessing->Out.FourCC = MFX_FOURCC_RGB4;
+    extdecvideoprocessing->Out.ChromaFormat = MFX_CHROMAFORMAT_YUV444;
+
+    extdecvideoprocessing->Out.Width        = FFALIGN(1920, 16);
+    extdecvideoprocessing->Out.Height       = FFALIGN(1080, 16);
+    extdecvideoprocessing->Out.CropX        = 0;
+    extdecvideoprocessing->Out.CropY        = 0;
+    extdecvideoprocessing->Out.CropW        = 1920;
+    extdecvideoprocessing->Out.CropH        = 1080;
+
+    extdecvideoprocessing->Header.BufferId = MFX_EXTBUFF_DEC_VIDEO_PROCESSING;
+    extdecvideoprocessing->Header.BufferSz = sizeof(mfxExtDecVideoProcessing);
+
+    q->extdecvideoprocessing = extdecvideoprocessing;
+
+    param->ExtParam = (mfxExtBuffer **)av_mallocz(sizeof(mfxExtBuffer *));
+    param->ExtParam[0] = (mfxExtBuffer *) extdecvideoprocessing;
+    param->NumExtParam++;
+    
+    av_log(avctx, AV_LOG_VERBOSE, "####extdecvideoprocessing\n");
+#endif
 
     ret = MFXVideoDECODE_Init(q->session, param);
     if (ret < 0)
