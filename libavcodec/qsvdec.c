@@ -660,6 +660,9 @@ static void qsv_decode_close_qsvcontext(QSVContext *q)
     av_buffer_pool_uninit(&q->pool);
 }
 
+// FIXME: Hardcode SFC output fourcc
+uint32_t sfc_csc_fourcc = MFX_FOURCC_RGB4;
+
 static int qsv_process_data(AVCodecContext *avctx, QSVContext *q,
                             AVFrame *frame, int *got_frame, const AVPacket *pkt)
 {
@@ -697,7 +700,8 @@ static int qsv_process_data(AVCodecContext *avctx, QSVContext *q,
         }
         q->reinit_flag = 0;
 
-        q->orig_pix_fmt = avctx->pix_fmt = pix_fmt = ff_qsv_map_fourcc(param.mfx.FrameInfo.FourCC);
+        q->orig_pix_fmt = avctx->pix_fmt = pix_fmt = 
+            ff_qsv_map_fourcc( (sfc_csc_fourcc == AV_PIX_FMT_NONE) ? param.mfx.FrameInfo.FourCC : sfc_csc_fourcc);
 
         avctx->coded_width  = param.mfx.FrameInfo.Width;
         avctx->coded_height = param.mfx.FrameInfo.Height;
