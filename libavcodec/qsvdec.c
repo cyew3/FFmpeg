@@ -90,12 +90,32 @@ typedef struct QSVContext {
     int iopattern;
     int gpu_copy;
 
+    int decpostproc;
+    int in_cropx;
+    int in_cropy;
+    int in_cropw;
+    int in_croph;
+
+    int out_w;
+    int out_h;
+    int out_cropx;
+    int out_cropy;
+    int out_cropw;
+    int out_croph;
+
+    uint32_t out_format;
+
     char *load_plugins;
 
     mfxPayload payload;
 
-    mfxExtBuffer **ext_buffers;
-    int         nb_ext_buffers;
+    mfxExtBuffer *extparam_internal[4];
+    int         nb_extparam_internal;
+
+    mfxExtBuffer **extparam;
+
+    mfxExtDecVideoProcessing extdecvideoprocessing;
+    mfxVideoParam param;
 
     H264SEIContext sei;
     H264ParamSets ps;
@@ -163,6 +183,37 @@ static int qsv_init_session(AVCodecContext *avctx, QSVContext *q, mfxSession ses
                         "only works in system memory mode.\n");
         q->gpu_copy = MFX_GPUCOPY_OFF;
     }
+
+    if (q->decpostproc) {
+
+        q->extdecvideoprocessing.Header.BufferId = MFX_EXTBUFF_DEC_VIDEO_PROCESSING;
+        q->extdecvideoprocessing.Header.BufferSz = sizeof(mfxExtDecVideoProcessing);
+
+        q->extdecvideoprocessing.In.CropX = q->in_cropx;
+        q->extdecvideoprocessing.In.CropY = q->in_cropy;
+        q->extdecvideoprocessing.In.CropW = q->in_cropw;
+        q->extdecvideoprocessing.In.CropH = q->in_croph;
+
+        q->extdecvideoprocessing.Out.Width = FFALIGN(q->out_w, 16);
+        q->extdecvideoprocessing.Out.Height = FFALIGN(q->out_h, 16);
+        q->extdecvideoprocessing.Out.CropX = q->out_cropx;
+        q->extdecvideoprocessing.Out.CropY = q->out_cropx;
+        q->extdecvideoprocessing.Out.CropW = q->out_cropw;
+        q->extdecvideoprocessing.Out.CropH = q->out_croph;
+
+        if (q->out_format == MFX_FOURCC_NV12)
+        {
+            q->extdecvideoprocessing.Out.FourCC = MFX_FOURCC_NV12;
+            q->extdecvideoprocessing.Out.ChromaFormat = MFX_CHROMAFORMAT_YUV420;
+        } else if (q->out_format == MFX_FOURCC_RGB4)
+        {
+            q->extdecvideoprocessing.Out.FourCC = MFX_FOURCC_RGB4;
+            q->extdecvideoprocessing.Out.ChromaFormat = MFX_CHROMAFORMAT_YUV444;
+        }
+
+        q->extparam_internal[q->nb_extparam_internal++] = (mfxExtBuffer *)&q->extdecvideoprocessing;
+    }
+
     if (session) {
         q->session = session;
     } else if (hw_frames_ref) {
@@ -261,8 +312,31 @@ static int qsv_decode_preinit(AVCodecContext *avctx, QSVContext *q, enum AVPixel
         AVQSVContext *user_ctx = avctx->hwaccel_context;
         session           = user_ctx->session;
         iopattern         = user_ctx->iopattern;
-        q->ext_buffers    = user_ctx->ext_buffers;
-        q->nb_ext_buffers = user_ctx->nb_ext_buffers;
+        int i, j;
+
+        q->extparam = av_mallocz_array(user_ctx->nb_ext_buffers + q->nb_extparam_internal,
+                                       sizeof(*q->extparam));
+        if (!q->extparam)
+            return AVERROR(ENOMEM);
+
+        q->param.ExtParam = q->extparam;
+        for (i = 0; i < user_ctx->nb_ext_buffers; i++)
+            q->param.ExtParam[i] = user_ctx->ext_buffers[i];
+        q->param.NumExtParam = user_ctx->nb_ext_buffers;
+
+        for (i = 0; i < q->nb_extparam_internal; i++) {
+            for (j = 0; j < user_ctx->nb_ext_buffers; j++) {
+                if (user_ctx->ext_buffers[j]->BufferId == q->extparam_internal[i]->BufferId)
+                    break;
+            }
+            if (j < user_ctx->nb_ext_buffers)
+                continue;
+
+            q->param.ExtParam[q->param.NumExtParam++] = q->extparam_internal[i];
+        }
+    } else {
+        q->param.ExtParam    = q->extparam_internal;
+        q->param.NumExtParam = q->nb_extparam_internal;
     }
 
     if (avctx->hw_device_ctx && !avctx->hw_frames_ctx && ret == AV_PIX_FMT_QSV) {
@@ -311,6 +385,7 @@ static int qsv_decode_preinit(AVCodecContext *avctx, QSVContext *q, enum AVPixel
         }
     }
 
+    iopattern = MFX_IOPATTERN_OUT_VIDEO_MEMORY; // FIXME
     if (!iopattern)
         iopattern = MFX_IOPATTERN_OUT_SYSTEM_MEMORY;
     q->iopattern = iopattern;
@@ -325,8 +400,6 @@ static int qsv_decode_preinit(AVCodecContext *avctx, QSVContext *q, enum AVPixel
 
     param->IOPattern   = q->iopattern;
     param->AsyncDepth  = q->async_depth;
-    param->ExtParam    = q->ext_buffers;
-    param->NumExtParam = q->nb_ext_buffers;
 
     return 0;
  }
@@ -409,9 +482,6 @@ static int qsv_decode_header(AVCodecContext *avctx, QSVContext *q,
         avctx->color_trc = video_signal_info.TransferCharacteristics;
         avctx->colorspace = video_signal_info.MatrixCoefficients;
     }
-
-    param->ExtParam    = q->ext_buffers;
-    param->NumExtParam = q->nb_ext_buffers;
 
     return 0;
 }
@@ -838,7 +908,7 @@ static int qsv_process_data(AVCodecContext *avctx, QSVContext *q,
                             AVFrame *frame, int *got_frame, const AVPacket *pkt)
 {
     int ret;
-    mfxVideoParam param = { 0 };
+    // mfxVideoParam param = { 0 }; // FIXME
     enum AVPixelFormat pix_fmt = AV_PIX_FMT_NV12;
 
     if (!pkt->size)
@@ -869,32 +939,33 @@ static int qsv_process_data(AVCodecContext *avctx, QSVContext *q,
         memset(&request, 0, sizeof(request));
 
         q->reinit_flag = 0;
-        ret = qsv_decode_header(avctx, q, pkt, pix_fmt, &param);
+        ret = qsv_decode_header(avctx, q, pkt, pix_fmt, &q->param);
         if (ret < 0) {
             av_log(avctx, AV_LOG_ERROR, "Error decoding header\n");
             goto reinit_fail;
         }
-        param.IOPattern = q->iopattern;
+        q->param.IOPattern = q->iopattern;
 
-        q->orig_pix_fmt = avctx->pix_fmt = pix_fmt = ff_qsv_map_fourcc(param.mfx.FrameInfo.FourCC);
+        q->orig_pix_fmt = avctx->pix_fmt = pix_fmt = 
+            ff_qsv_map_fourcc( (q->out_format == q->param.mfx.FrameInfo.FourCC) ? q->param.mfx.FrameInfo.FourCC : q->out_format );
 
-        avctx->coded_width  = param.mfx.FrameInfo.Width;
-        avctx->coded_height = param.mfx.FrameInfo.Height;
+        avctx->coded_width  = q->param.mfx.FrameInfo.Width;
+        avctx->coded_height = q->param.mfx.FrameInfo.Height;
 
-        ret = MFXVideoDECODE_QueryIOSurf(q->session, &param, &request);
+        ret = MFXVideoDECODE_QueryIOSurf(q->session, &q->param, &request);
         if (ret < 0)
             return ff_qsv_print_error(avctx, ret, "Error querying IO surface");
 
         q->suggest_pool_size = request.NumFrameSuggested;
 
-        ret = qsv_decode_preinit(avctx, q, pix_fmt, &param);
+        ret = qsv_decode_preinit(avctx, q, pix_fmt, &q->param);
         if (ret < 0)
             goto reinit_fail;
         q->initialized = 0;
     }
 
     if (!q->initialized) {
-        ret = qsv_decode_init_context(avctx, q, &param);
+        ret = qsv_decode_init_context(avctx, q, &q->param);
         if (ret < 0)
             goto reinit_fail;
         q->initialized = 1;
@@ -1097,6 +1168,8 @@ const AVCodec ff_##x##_qsv_decoder = { \
 
 #define DEFINE_QSV_DECODER(x, X, bsf_name) DEFINE_QSV_DECODER_WITH_OPTION(x, X, bsf_name, options)
 
+#define FLAGS (AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_FILTERING_PARAM)
+
 #if CONFIG_HEVC_QSV_DECODER
 static const AVOption hevc_options[] = {
     { "async_depth", "Internal parallelization depth, the higher the value the higher the latency.", OFFSET(qsv.async_depth), AV_OPT_TYPE_INT, { .i64 = ASYNC_DEPTH_DEFAULT }, 1, INT_MAX, VD },
@@ -1113,6 +1186,23 @@ static const AVOption hevc_options[] = {
         { "default", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = MFX_GPUCOPY_DEFAULT }, 0, 0, VD, "gpu_copy"},
         { "on",      NULL, 0, AV_OPT_TYPE_CONST, { .i64 = MFX_GPUCOPY_ON },      0, 0, VD, "gpu_copy"},
         { "off",     NULL, 0, AV_OPT_TYPE_CONST, { .i64 = MFX_GPUCOPY_OFF },     0, 0, VD, "gpu_copy"},
+
+    { "decpostproc",    "enable decoder post proc csc and scaling",   OFFSET(qsv.decpostproc), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VD },
+    { "in_cropx",       "set the input x crop area expression",       OFFSET(qsv.in_cropx), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+    { "in_cropy",       "set the input y crop area expression",       OFFSET(qsv.in_cropy), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+    { "in_cropw",       "set the input width crop area expression",   OFFSET(qsv.in_cropw), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+    { "in_croph",       "set the input height crop area expression",  OFFSET(qsv.in_croph), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+
+    { "out_w",          "Output video width",                           OFFSET(qsv.out_w), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },  
+    { "out_h",          "Output video height",                          OFFSET(qsv.out_h), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+    { "out_cropx",      "set the output x crop area expression",       OFFSET(qsv.out_cropx), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+    { "out_cropy",      "set the output y crop area expression",       OFFSET(qsv.out_cropy), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+    { "out_cropw",      "set the output width crop area expression",   OFFSET(qsv.out_cropw), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+    { "out_croph",      "set the output height crop area expression",  OFFSET(qsv.out_croph), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+    { "out_format",     "Output pixel format",                         OFFSET(qsv.out_format), AV_OPT_TYPE_INT, { .i64 = MFX_FOURCC_NV12 }, 0, INT_MAX, VD, "out_format" },
+        { "nv12", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = MFX_FOURCC_NV12 }, 0, 0, VD, "out_format" },
+        { "rgb",  NULL, 0, AV_OPT_TYPE_CONST, { .i64 = MFX_FOURCC_RGB4 }, 0, 0, VD, "out_format" },
+
     { NULL },
 };
 DEFINE_QSV_DECODER_WITH_OPTION(hevc, HEVC, "hevc_mp4toannexb", hevc_options)
@@ -1125,6 +1215,23 @@ static const AVOption options[] = {
         { "default", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = MFX_GPUCOPY_DEFAULT }, 0, 0, VD, "gpu_copy"},
         { "on",      NULL, 0, AV_OPT_TYPE_CONST, { .i64 = MFX_GPUCOPY_ON },      0, 0, VD, "gpu_copy"},
         { "off",     NULL, 0, AV_OPT_TYPE_CONST, { .i64 = MFX_GPUCOPY_OFF },     0, 0, VD, "gpu_copy"},
+
+    { "decpostproc",    "enable decoder post proc csc and scaling",   OFFSET(qsv.decpostproc), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VD },
+    { "in_cropx",       "set the input x crop area expression",       OFFSET(qsv.in_cropx), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+    { "in_cropy",       "set the input y crop area expression",       OFFSET(qsv.in_cropy), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+    { "in_cropw",       "set the input width crop area expression",   OFFSET(qsv.in_cropw), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+    { "in_croph",       "set the input height crop area expression",  OFFSET(qsv.in_croph), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+
+    { "out_w",          "Output video width",                           OFFSET(qsv.out_w), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },  
+    { "out_h",          "Output video height",                          OFFSET(qsv.out_h), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+    { "out_cropx",      "set the output x crop area expression",       OFFSET(qsv.out_cropx), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+    { "out_cropy",      "set the output y crop area expression",       OFFSET(qsv.out_cropy), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+    { "out_cropw",      "set the output width crop area expression",   OFFSET(qsv.out_cropw), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+    { "out_croph",      "set the output height crop area expression",  OFFSET(qsv.out_croph), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+    { "out_format",     "Output pixel format",                         OFFSET(qsv.out_format), AV_OPT_TYPE_INT, { .i64 = MFX_FOURCC_NV12 }, 0, INT_MAX, VD, "out_format" },
+        { "nv12", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = MFX_FOURCC_NV12 }, 0, 0, VD, "out_format" },
+        { "rgb",  NULL, 0, AV_OPT_TYPE_CONST, { .i64 = MFX_FOURCC_RGB4 }, 0, 0, VD, "out_format" },
+
     { NULL },
 };
 
