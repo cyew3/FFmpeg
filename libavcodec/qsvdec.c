@@ -49,6 +49,8 @@
 #include "h264_sei.h"
 #include "qsv_internal.h"
 
+#define QSV_HAVE_EXT_DEC_VIDEO_PROCESSING QSV_VERSION_ATLEAST(1, 1)
+
 static const AVRational mfx_tb = { 1, 90000 };
 
 #define PTS_TO_MFX_PTS(pts, pts_tb) ((pts) == AV_NOPTS_VALUE ? \
@@ -90,6 +92,7 @@ typedef struct QSVContext {
     int iopattern;
     int gpu_copy;
 
+#ifdef QSV_HAVE_EXT_DEC_VIDEO_PROCESSING
     int decpostproc;
     int in_cropx;
     int in_cropy;
@@ -103,7 +106,8 @@ typedef struct QSVContext {
     int out_cropw;
     int out_croph;
 
-    uint32_t out_format;
+    enum AVPixelFormat out_format;
+#endif
 
     char *load_plugins;
 
@@ -114,7 +118,9 @@ typedef struct QSVContext {
 
     mfxExtBuffer **extparam;
 
+#ifdef QSV_HAVE_EXT_DEC_VIDEO_PROCESSING
     mfxExtDecVideoProcessing extdecvideoprocessing;
+#endif
     mfxVideoParam param;
 
     H264SEIContext sei;
@@ -184,8 +190,8 @@ static int qsv_init_session(AVCodecContext *avctx, QSVContext *q, mfxSession ses
         q->gpu_copy = MFX_GPUCOPY_OFF;
     }
 
+#ifdef QSV_HAVE_EXT_DEC_VIDEO_PROCESSING
     if (q->decpostproc) {
-
         q->extdecvideoprocessing.Header.BufferId = MFX_EXTBUFF_DEC_VIDEO_PROCESSING;
         q->extdecvideoprocessing.Header.BufferSz = sizeof(mfxExtDecVideoProcessing);
 
@@ -201,18 +207,41 @@ static int qsv_init_session(AVCodecContext *avctx, QSVContext *q, mfxSession ses
         q->extdecvideoprocessing.Out.CropW = q->out_cropw;
         q->extdecvideoprocessing.Out.CropH = q->out_croph;
 
-        if (q->out_format == MFX_FOURCC_NV12)
-        {
+        if (q->out_format == AV_PIX_FMT_NV12) {
             q->extdecvideoprocessing.Out.FourCC = MFX_FOURCC_NV12;
             q->extdecvideoprocessing.Out.ChromaFormat = MFX_CHROMAFORMAT_YUV420;
-        } else if (q->out_format == MFX_FOURCC_RGB4)
-        {
+        } else if (q->out_format == AV_PIX_FMT_P010) {
+            q->extdecvideoprocessing.Out.FourCC = MFX_FOURCC_P010;
+            q->extdecvideoprocessing.Out.ChromaFormat = MFX_CHROMAFORMAT_YUV420;
+        } else if (q->out_format == AV_PIX_FMT_P016) {
+            q->extdecvideoprocessing.Out.FourCC = MFX_FOURCC_P016;
+            q->extdecvideoprocessing.Out.ChromaFormat = MFX_CHROMAFORMAT_YUV420;
+        } else if (q->out_format == AV_PIX_FMT_YUYV422) {
+            q->extdecvideoprocessing.Out.FourCC = MFX_FOURCC_YUY2;
+            q->extdecvideoprocessing.Out.ChromaFormat = MFX_CHROMAFORMAT_YUV422;
+        } else if (q->out_format == AV_PIX_FMT_Y210) {
+            q->extdecvideoprocessing.Out.FourCC = MFX_FOURCC_Y210;
+            q->extdecvideoprocessing.Out.ChromaFormat = MFX_CHROMAFORMAT_YUV422;
+        } else if (q->out_format == AV_PIX_FMT_Y212) {
+            q->extdecvideoprocessing.Out.FourCC = MFX_FOURCC_Y216;
+            q->extdecvideoprocessing.Out.ChromaFormat = MFX_CHROMAFORMAT_YUV422;
+        } else if (q->out_format == AV_PIX_FMT_YUV444P) {
+            q->extdecvideoprocessing.Out.FourCC = MFX_FOURCC_AYUV;
+            q->extdecvideoprocessing.Out.ChromaFormat = MFX_CHROMAFORMAT_YUV444;
+        } else if (q->out_format == AV_PIX_FMT_Y410) {
+            q->extdecvideoprocessing.Out.FourCC = MFX_FOURCC_Y410;
+            q->extdecvideoprocessing.Out.ChromaFormat = MFX_CHROMAFORMAT_YUV444;
+        } else if (q->out_format == AV_PIX_FMT_Y412) {
+            q->extdecvideoprocessing.Out.FourCC = MFX_FOURCC_Y416;
+            q->extdecvideoprocessing.Out.ChromaFormat = MFX_CHROMAFORMAT_YUV444;
+        } else if (q->out_format == AV_PIX_FMT_BGRA) {
             q->extdecvideoprocessing.Out.FourCC = MFX_FOURCC_RGB4;
             q->extdecvideoprocessing.Out.ChromaFormat = MFX_CHROMAFORMAT_YUV444;
         }
 
         q->extparam_internal[q->nb_extparam_internal++] = (mfxExtBuffer *)&q->extdecvideoprocessing;
     }
+#endif
 
     if (session) {
         q->session = session;
@@ -314,7 +343,7 @@ static int qsv_decode_preinit(AVCodecContext *avctx, QSVContext *q, enum AVPixel
         iopattern         = user_ctx->iopattern;
         int i, j;
 
-        q->extparam = av_mallocz_array(user_ctx->nb_ext_buffers + q->nb_extparam_internal,
+        q->extparam = av_calloc(user_ctx->nb_ext_buffers + q->nb_extparam_internal,
                                        sizeof(*q->extparam));
         if (!q->extparam)
             return AVERROR(ENOMEM);
@@ -385,7 +414,6 @@ static int qsv_decode_preinit(AVCodecContext *avctx, QSVContext *q, enum AVPixel
         }
     }
 
-    iopattern = MFX_IOPATTERN_OUT_VIDEO_MEMORY; // FIXME
     if (!iopattern)
         iopattern = MFX_IOPATTERN_OUT_SYSTEM_MEMORY;
     q->iopattern = iopattern;
@@ -908,7 +936,6 @@ static int qsv_process_data(AVCodecContext *avctx, QSVContext *q,
                             AVFrame *frame, int *got_frame, const AVPacket *pkt)
 {
     int ret;
-    // mfxVideoParam param = { 0 }; // FIXME
     enum AVPixelFormat pix_fmt = AV_PIX_FMT_NV12;
 
     if (!pkt->size)
@@ -946,8 +973,10 @@ static int qsv_process_data(AVCodecContext *avctx, QSVContext *q,
         }
         q->param.IOPattern = q->iopattern;
 
-        q->orig_pix_fmt = avctx->pix_fmt = pix_fmt = 
-            ff_qsv_map_fourcc( (q->out_format == q->param.mfx.FrameInfo.FourCC) ? q->param.mfx.FrameInfo.FourCC : q->out_format );
+        if ( q->out_format == ff_qsv_map_fourcc(q->param.mfx.FrameInfo.FourCC) )
+            q->orig_pix_fmt = avctx->pix_fmt = pix_fmt = ff_qsv_map_fourcc(q->param.mfx.FrameInfo.FourCC);
+        else
+            q->orig_pix_fmt = avctx->pix_fmt = pix_fmt = q->out_format;
 
         avctx->coded_width  = q->param.mfx.FrameInfo.Width;
         avctx->coded_height = q->param.mfx.FrameInfo.Height;
@@ -1187,21 +1216,21 @@ static const AVOption hevc_options[] = {
         { "on",      NULL, 0, AV_OPT_TYPE_CONST, { .i64 = MFX_GPUCOPY_ON },      0, 0, VD, "gpu_copy"},
         { "off",     NULL, 0, AV_OPT_TYPE_CONST, { .i64 = MFX_GPUCOPY_OFF },     0, 0, VD, "gpu_copy"},
 
-    { "decpostproc",    "enable decoder post proc csc and scaling",   OFFSET(qsv.decpostproc), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VD },
-    { "in_cropx",       "set the input x crop area expression",       OFFSET(qsv.in_cropx), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
-    { "in_cropy",       "set the input y crop area expression",       OFFSET(qsv.in_cropy), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
-    { "in_cropw",       "set the input width crop area expression",   OFFSET(qsv.in_cropw), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
-    { "in_croph",       "set the input height crop area expression",  OFFSET(qsv.in_croph), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+#ifdef QSV_HAVE_EXT_DEC_VIDEO_PROCESSING
+    { "decpostproc",    "Enable decoder post proc csc and scaling",   OFFSET(qsv.decpostproc), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VD },
+    { "in_cropx",       "Set the input x crop area expression",       OFFSET(qsv.in_cropx), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+    { "in_cropy",       "Set the input y crop area expression",       OFFSET(qsv.in_cropy), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+    { "in_cropw",       "Set the input width crop area expression",   OFFSET(qsv.in_cropw), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+    { "in_croph",       "Set the input height crop area expression",  OFFSET(qsv.in_croph), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
 
     { "out_w",          "Output video width",                           OFFSET(qsv.out_w), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },  
     { "out_h",          "Output video height",                          OFFSET(qsv.out_h), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
-    { "out_cropx",      "set the output x crop area expression",       OFFSET(qsv.out_cropx), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
-    { "out_cropy",      "set the output y crop area expression",       OFFSET(qsv.out_cropy), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
-    { "out_cropw",      "set the output width crop area expression",   OFFSET(qsv.out_cropw), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
-    { "out_croph",      "set the output height crop area expression",  OFFSET(qsv.out_croph), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
-    { "out_format",     "Output pixel format",                         OFFSET(qsv.out_format), AV_OPT_TYPE_INT, { .i64 = MFX_FOURCC_NV12 }, 0, INT_MAX, VD, "out_format" },
-        { "nv12", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = MFX_FOURCC_NV12 }, 0, 0, VD, "out_format" },
-        { "rgb",  NULL, 0, AV_OPT_TYPE_CONST, { .i64 = MFX_FOURCC_RGB4 }, 0, 0, VD, "out_format" },
+    { "out_cropx",      "Set the output x crop area expression",       OFFSET(qsv.out_cropx), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+    { "out_cropy",      "Set the output y crop area expression",       OFFSET(qsv.out_cropy), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+    { "out_cropw",      "Set the output width crop area expression",   OFFSET(qsv.out_cropw), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+    { "out_croph",      "Set the output height crop area expression",  OFFSET(qsv.out_croph), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+    { "out_format",     "Output pixel format",                         OFFSET(qsv.out_format), AV_OPT_TYPE_PIXEL_FMT, { .i64 = AV_PIX_FMT_NV12}, AV_PIX_FMT_NONE, AV_PIX_FMT_NB, VD },
+#endif
 
     { NULL },
 };
@@ -1216,21 +1245,21 @@ static const AVOption options[] = {
         { "on",      NULL, 0, AV_OPT_TYPE_CONST, { .i64 = MFX_GPUCOPY_ON },      0, 0, VD, "gpu_copy"},
         { "off",     NULL, 0, AV_OPT_TYPE_CONST, { .i64 = MFX_GPUCOPY_OFF },     0, 0, VD, "gpu_copy"},
 
-    { "decpostproc",    "enable decoder post proc csc and scaling",   OFFSET(qsv.decpostproc), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VD },
-    { "in_cropx",       "set the input x crop area expression",       OFFSET(qsv.in_cropx), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
-    { "in_cropy",       "set the input y crop area expression",       OFFSET(qsv.in_cropy), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
-    { "in_cropw",       "set the input width crop area expression",   OFFSET(qsv.in_cropw), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
-    { "in_croph",       "set the input height crop area expression",  OFFSET(qsv.in_croph), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+#ifdef QSV_HAVE_EXT_DEC_VIDEO_PROCESSING
+    { "decpostproc",    "Enable decoder post proc csc and scaling",   OFFSET(qsv.decpostproc), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VD },
+    { "in_cropx",       "Set the input x crop area expression",       OFFSET(qsv.in_cropx), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+    { "in_cropy",       "Set the input y crop area expression",       OFFSET(qsv.in_cropy), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+    { "in_cropw",       "Set the input width crop area expression",   OFFSET(qsv.in_cropw), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+    { "in_croph",       "Set the input height crop area expression",  OFFSET(qsv.in_croph), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
 
     { "out_w",          "Output video width",                           OFFSET(qsv.out_w), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },  
     { "out_h",          "Output video height",                          OFFSET(qsv.out_h), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
-    { "out_cropx",      "set the output x crop area expression",       OFFSET(qsv.out_cropx), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
-    { "out_cropy",      "set the output y crop area expression",       OFFSET(qsv.out_cropy), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
-    { "out_cropw",      "set the output width crop area expression",   OFFSET(qsv.out_cropw), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
-    { "out_croph",      "set the output height crop area expression",  OFFSET(qsv.out_croph), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
-    { "out_format",     "Output pixel format",                         OFFSET(qsv.out_format), AV_OPT_TYPE_INT, { .i64 = MFX_FOURCC_NV12 }, 0, INT_MAX, VD, "out_format" },
-        { "nv12", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = MFX_FOURCC_NV12 }, 0, 0, VD, "out_format" },
-        { "rgb",  NULL, 0, AV_OPT_TYPE_CONST, { .i64 = MFX_FOURCC_RGB4 }, 0, 0, VD, "out_format" },
+    { "out_cropx",      "Set the output x crop area expression",       OFFSET(qsv.out_cropx), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+    { "out_cropy",      "Set the output y crop area expression",       OFFSET(qsv.out_cropy), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+    { "out_cropw",      "Set the output width crop area expression",   OFFSET(qsv.out_cropw), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+    { "out_croph",      "Set the output height crop area expression",  OFFSET(qsv.out_croph), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VD },
+    { "out_format",     "Output pixel format",                         OFFSET(qsv.out_format), AV_OPT_TYPE_PIXEL_FMT, { .i64 = AV_PIX_FMT_NV12}, AV_PIX_FMT_NONE, AV_PIX_FMT_NB, VD },
+#endif
 
     { NULL },
 };
